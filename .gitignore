@@ -1,0 +1,48 @@
+# --- Python virtual environment --------------------------------------------
+.venv/
+venv/
+env/
+
+# --- Python bytecode and build artifacts -----------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# --- Secrets ----------------------------------------------------------------
+# .env holds local credentials and rail toggles; .env.example is committed instead.
+.env
+
+# --- Local databases and agent state ----------------------------------------
+*.db
+*.sqlite
+*.sqlite3
+# LangGraph checkpointer backing the HITL interrupts (§3.3). SQLite's write-ahead log
+# and shared-memory sidecars are separate files and are NOT matched by *.db.
+checkpoints.db
+*.db-shm
+*.db-wal
+
+# --- Postgres volume data (if bind-mounted instead of a named volume) -------
+pgdata/
+postgres-data/
+db/data/
+
+# --- Generated red-team output ----------------------------------------------
+redteam/latency.jsonl
+redteam/RESULTS.md
+
+# --- Model / tooling caches -------------------------------------------------
+.cache/
+.huggingface/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Windows / editor noise -------------------------------------------------
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+*.swp

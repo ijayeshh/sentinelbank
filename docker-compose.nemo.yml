@@ -1,0 +1,4 @@
+# Separate compose profile for the NeMo Guardrails comparison stack (PROJECT_PLAN.md §4.4).
+# MUST NOT run alongside the main stack — NeMo loads its own embedding model and vector
+# index (~200 MB plus index) that the 8 GB RAM budget cannot absorb concurrently
+# (§1.1 rule 7). Not implemented until Phase 4.

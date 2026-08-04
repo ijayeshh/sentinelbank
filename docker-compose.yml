@@ -1,0 +1,54 @@
+# SentinelBank — main stack (PROJECT_PLAN.md §1.4)
+#
+# One service only. PostgreSQL 16 with pgvector serves both the relational banking
+# data and the policy-document embeddings; the application itself runs natively on
+# Windows, not in a container.
+#
+# Docker's memory is capped to 3GB via %USERPROFILE%\.wslconfig so it cannot starve
+# Ollama on this 8GB machine — see README.md step 2.
+#
+# NOTE: db/schema.sql is executed by /docker-entrypoint-initdb.d on FIRST BOOT ONLY,
+# against an empty data volume. Changing the schema therefore requires destroying the
+# volume:  docker compose down -v; docker compose up -d
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: sentinelbank-postgres
+    restart: unless-stopped
+
+    # Credentials come from .env, which Compose reads automatically. The defaults
+    # match app/config.py and .env.example so the stack starts without a .env file.
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-sentinelbank}
+      POSTGRES_USER: ${POSTGRES_USER:-sentinel}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-sentinel}
+      # Deterministic collation, so ORDER BY on text columns cannot vary by host
+      # locale — the red-team harness asserts against specific seeded rows.
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+
+    ports:
+      # Host port is configurable; the container always listens on 5432.
+      - "${POSTGRES_PORT:-5432}:5432"
+
+    volumes:
+      # Named volume — data survives `docker compose down`, dies on `down -v`.
+      - sentinelbank-pgdata:/var/lib/postgresql/data
+      # Read-only mount: init scripts run once, on an empty volume, in name order.
+      - ./db/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+
+    # Lets `docker compose up -d --wait` and db/seed.py know when Postgres is ready
+    # to accept connections rather than merely running.
+    healthcheck:
+      test:
+        ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-sentinel} -d ${POSTGRES_DB:-sentinelbank}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      # Init scripts run before the server accepts external connections; give the
+      # first-boot schema load room to finish before failures start counting.
+      start_period: 30s
+
+volumes:
+  sentinelbank-pgdata:
+    name: sentinelbank-pgdata

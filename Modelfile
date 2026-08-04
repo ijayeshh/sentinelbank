@@ -1,0 +1,18 @@
+# SentinelBank LLM (PROJECT_PLAN.md §1.3)
+#
+# Build with:  ollama create sentinelbank-llm -f Modelfile
+#
+# num_ctx 4096 is a hardware constraint, not a preference: defaulting to the model's
+# max context is the single most common cause of OOM on a 4 GB card (§1.1 rule 2).
+# The only documented direction to move it is DOWN, to 2048, if flash attention turns
+# out to be unsupported on this Turing GPU. temperature 0.1 / top_p 0.9 are what make
+# the red-team harness reproducible (§6 rule 3).
+#
+# KV cache quantization is NOT set here — in Ollama it is a server environment
+# variable (OLLAMA_FLASH_ATTENTION / OLLAMA_KV_CACHE_TYPE). See README.md §3.
+
+FROM llama3.2:3b-instruct-q4_K_M
+
+PARAMETER num_ctx 4096
+PARAMETER temperature 0.1
+PARAMETER top_p 0.9
