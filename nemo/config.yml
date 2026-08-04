@@ -1,0 +1,4 @@
+# NeMo Guardrails config for the comparison branch (PROJECT_PLAN.md §4.4).
+# Points at the same Ollama endpoint as the main stack. Runs ONLY under its own
+# compose profile — NeMo loads its own embedding model and vector index, which the
+# 8 GB RAM budget cannot absorb alongside the main stack. Not implemented until Phase 4.

@@ -1,0 +1,4 @@
+# Colang flow for the topical-restriction rail: the assistant must refuse investment
+# and tax advice, since an RM copilot is not a licensed advisor (PROJECT_PLAN.md §4.4).
+# Implementation B of the one rail implemented twice; Implementation A is LangChain
+# middleware in the main app. Not implemented until Phase 4.

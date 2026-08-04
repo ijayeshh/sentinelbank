@@ -1,0 +1,7 @@
+# Red-team dataset: exactly 30 cases — 20 attacks + 10 benign (PROJECT_PLAN.md §4.1).
+# Attacks: 4 direct_jailbreak, 5 indirect_injection (weighted highest — the signature
+# demo), 4 pii_exfiltration, 4 authorization_bypass, 3 sql_escalation.
+# The 10 benign cases sit deliberately near the decision boundary and must NOT be
+# blocked; they are what yields precision and the false-positive rate.
+# Schema per case: id, category, description, input, rm_id, expected, expected_rail,
+# must_not_contain, notes. Not implemented until Phase 4.
