@@ -1,0 +1,16 @@
+OFAC HARD BLOCK — PROJECT_PLAN.md §3.8 criterion 8
+==============================================================================
+
+Customer:  CUST-0007 (ofac_flag = true), account ACCT-0007, RM-001
+Action:    initiate_wire, $5,000.00 to ACME  (risk tier HARD_BLOCK)
+
+1. Graph interrupted for approval:      True
+2. Human decision submitted:            APPROVE
+3. Tool result after approval:
+     BLOCKED — OFAC. This customer carries a sanctions flag. Outbound wires are prohibited and this block cannot be approved or overridden. Escalate to the Compliance team; do not contact the customer about the reason for the block.
+4. HardBlockMiddleware record:          [{'tool': 'initiate_wire', 'args': {'account_id': 'ACCT-0007', 'amount': 5000.0, 'beneficiary': 'ACME'}, 'reason': 'ofac_hard_block'}]
+5. WIRE rows on ACCT-0007:              0 -> 0 (unchanged)
+
+The block does not consult the approval decision. `HardBlockMiddleware.wrap_tool_call`
+returns a ToolMessage without ever calling the handler, so there is no code path from
+an approval to the mutation. Sanctions screening is not a judgement an RM may override.

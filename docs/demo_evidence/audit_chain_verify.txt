@@ -1,0 +1,17 @@
+AUDIT CHAIN — PROJECT_PLAN.md §3.8 criterion 9
+==============================================================================
+
+(a) live audit_log, 110 entries: verify_chain() -> None
+(b) fresh 5-entry chain: verify_chain() -> None
+(c) mutated the response_summary of index 2 (event_id 951): verify_chain() -> 2, reason hash_mismatch
+(d) deleted index 2: verify_chain() -> 2, reason broken_link
+(e) live table after rollback: verify_chain() -> None
+
+A mutation is caught by the integrity check (the row no longer hashes to its
+stored entry_hash). A deletion is caught by the linkage check instead: the surviving
+rows still hash correctly, and only the broken prev_hash of the orphaned successor
+reveals that something was removed. Both are reported at index 2, the position of the
+entry that was attacked.
+
+All tampering happened inside a transaction that was rolled
+back; the live table is untouched and still verifies.
