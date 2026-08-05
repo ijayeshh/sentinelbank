@@ -30,8 +30,15 @@ postgres-data/
 db/data/
 
 # --- Generated red-team output ----------------------------------------------
+# latency.jsonl is a raw append-only sample log that grows on every run — a build
+# artifact, not a deliverable.
 redteam/latency.jsonl
-redteam/RESULTS.md
+# results.jsonl is one row per case from the last `pytest redteam/` run. Committed:
+# report.py consumes it, and it is the evidence behind the numbers in RESULTS.md.
+#
+# RESULTS.md is deliberately NOT ignored. §4.3 calls it a deliverable and README.md
+# links to it, so ignoring it left a fresh clone with a broken link to the one file
+# that carries the measured rail-effectiveness and latency tables.
 
 # --- Model / tooling caches -------------------------------------------------
 .cache/
