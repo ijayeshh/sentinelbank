@@ -34,6 +34,10 @@ RAILS_ALL_ON = {
     "injection_tool_result": True,
     "spotlight": True,
     "audit": True,
+    # §4.4's comparison rail. Not one of §3.4's eight positions, but it is a real flag on
+    # RailsConfig and the sidebar renders a toggle for it, so a fake backend that omits it
+    # hands the UI a missing key and the toggle renders off.
+    "topical": True,
 }
 
 HEALTH = {
@@ -287,15 +291,25 @@ def test_all_eight_rails_have_a_labelled_toggle(backend):
     at = run_app()
 
     toggles = at.sidebar.toggle
-    assert len(toggles) == 8
-    for position, toggle in enumerate(toggles, start=1):
+    # §3.4's eight numbered positions, plus §4.4's comparison rail rendered last and
+    # deliberately unnumbered — it is not part of the plan's stack.
+    assert len(toggles) == 9
+    for position, toggle in enumerate(toggles[:8], start=1):
         assert toggle.label.startswith(f"**{position}."), toggle.label
         assert toggle.value is True
+
+    comparison = toggles[8]
+    assert "§4.4" in comparison.label, comparison.label
+    assert not comparison.label.startswith("**9."), (
+        "the comparison rail must not be numbered as a ninth §3.4 position"
+    )
+    assert comparison.value is True
 
     # Every toggle says what it protects against, not just what it is called.
     text = sidebar_text(at)
     assert "Direct jailbreaks typed into the chat box" in text
     assert "Poisoned transaction memos" in text
+    assert "not licensed" in text
 
 
 def test_toggling_a_rail_posts_it_to_the_backend(backend):

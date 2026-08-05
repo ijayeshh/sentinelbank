@@ -311,6 +311,88 @@ def test_identifier_protection_does_not_weaken_pii_detection(seeded):
     assert "[REDACTED_US_SSN]" in redacted
 
 
+# --------------------------------------------------------------------------------
+# Defect 26: the pseudonymizer destroying amounts and channel enums
+# --------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "Decimal('-2004.42",  # the span Presidio actually returned, unbalanced quote and all
+        "Decimal('2864.63')",
+        "8)",  # tail of datetime.datetime(2025, 6, 3, 22, 28)
+        "datetime.date(2016, 7, 10)",
+        "ZELLE",
+        "ACH",
+        "CHECKING",
+        "MONEY_MARKET",
+    ],
+)
+def test_repr_fragments_and_enums_are_not_treated_as_people(value):
+    """Observed in the rails-ON demo: `$Decimal('-2004.42` and a channel reading as a name.
+
+    Both symptoms came from the rail scanning the flat `str()` of a tool envelope, where
+    spaCy sees Python repr fragments and SQL enums as prose. Either one makes the guarded
+    answer *worse* than the unguarded one, which inverts the whole demo.
+    """
+    assert [m for m in resolve_entities(value) if m.entity == "PERSON"] == []
+
+
+def test_a_tool_envelope_survives_pseudonymization_structurally_intact(seeded):
+    """The end-to-end shape of defect 26: names go, everything else stays byte-identical."""
+    from app.agent.tools import get_account_summary
+    from app.rails.pii import PersonPseudonymMiddleware, PseudonymMap
+
+    envelope = get_account_summary("ACCT-0007", "RM-001")
+    rendered = str(envelope)
+    assert "Decimal(" in rendered and "ZELLE" in rendered, "fixture no longer exercises this"
+
+    replaced = PersonPseudonymMiddleware()._pseudonymize(
+        rendered, PseudonymMap(salt="test-salt")
+    )
+
+    assert replaced.count("Decimal(") == rendered.count("Decimal(")
+    assert replaced.count("datetime.") == rendered.count("datetime.")
+    assert replaced.count("ZELLE") == rendered.count("ZELLE")
+    assert "<PERSON_" in replaced, "the rail stopped doing its actual job"
+
+
+def test_every_seeded_customer_name_still_survives_the_shape_rules():
+    """The cost of the two shape rules must be zero on the thing they could break.
+
+    Measured when the rules were introduced: 0 of 40. Asserted here so a future tweak to
+    `_is_schema_artifact` cannot quietly start dropping real customers.
+    """
+    from app.rails.pii import _is_schema_artifact
+
+    with get_session() as session:
+        names = [r[0] for r in session.execute(text("SELECT full_name FROM customers")).all()]
+
+    assert len(names) == 40, "seed data has drifted; re-run python db/seed.py"
+
+    for name in names:
+        assert not _is_schema_artifact(name), name
+        row = f"{{'customer_id': 'CUST-0001', 'full_name': '{name}', 'status': 'ACTIVE'}}"
+        spans = [m.value for m in resolve_entities(row) if m.entity == "PERSON"]
+        assert any(name in span or span in name for span in spans), (
+            f"{name!r} is no longer detected inside a serialized row"
+        )
+
+
+def test_multi_word_all_caps_spans_are_still_treated_as_names():
+    """Rule B tests for a single token, not for capitalisation.
+
+    `MAUREEN W` is a Zelle counterparty inside a memo — a real third party. Rejecting
+    every all-caps span would drop 35 of these; rejecting only single tokens drops 7.
+    """
+    from app.rails.pii import _is_schema_artifact
+
+    assert not _is_schema_artifact("MAUREEN W")
+    assert not _is_schema_artifact("STACEY H")
+    assert _is_schema_artifact("ZELLE")
+
+
 def test_weak_confidence_matches_are_dropped():
     """A 0.01-confidence guess must not destroy data; a real 0.30 licence still must."""
     from app.rails.pii import MIN_ENTITY_SCORE, redact_text

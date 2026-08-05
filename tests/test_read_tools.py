@@ -434,7 +434,50 @@ def test_rail_timer_records_one_sample_per_tool_call(tmp_path):
 
     # And it reached the JSONL file the §4.3 report will aggregate.
     assert timing.LATENCY_LOG_PATH.exists()
-    assert len(timing.LATENCY_LOG_PATH.read_text(encoding="utf-8").splitlines()) == 2
+    assert len(timing.LATENCY_LOG_PATH.read_text(encoding="utf-8").splitlines()) == 5
+
+
+def test_sql_rails_are_timed_under_their_section_4_3_names():
+    """§4.3's table has `sql_guard` and `entitlement` rows; they have to be fillable.
+
+    `sql_guard` is sampled twice per query on purpose — `safe_execute` validates the
+    model's SQL, rewrites it, then validates the rewrite. Both runs are real work and
+    both belong in the budget.
+    """
+    query_customer_data(ALL_CUSTOMERS, RM1)
+
+    assert len(timing.get_samples("sql_guard")) == 2, "validate + revalidate"
+    assert len(timing.get_samples("entitlement")) == 1
+    assert all(s["duration_ms"] >= 0 for s in timing.get_samples("sql_guard"))
+
+
+def test_a_rejected_query_still_times_the_rail_that_rejected_it():
+    """The reject path is the one §4.3 would otherwise under-report."""
+    query_customer_data("DROP TABLE customers", RM1)
+
+    # Rejected at step 1, so sql_guard ran once and entitlement never got the chance.
+    assert len(timing.get_samples("sql_guard")) == 1
+    assert timing.get_samples("entitlement") == []
+
+
+def test_tool_spans_enclose_the_sql_rails_rather_than_excluding_them():
+    """The overlap §4.3's total must not double-count.
+
+    `tool_*` wraps the whole tool body, so `sql_guard` and `entitlement` run *inside* it.
+    That is unavoidable — they are nested calls — so the contract is that the report
+    treats tool spans as a separate class rather than adding them to the rail total.
+    This test pins the nesting so the classification in `app/main.py` stays justified.
+    """
+    query_customer_data(ALL_CUSTOMERS, RM1)
+
+    tool_ms = timing.get_samples("tool_query_customer_data")[0]["duration_ms"]
+    nested_ms = sum(
+        s["duration_ms"]
+        for rail in ("sql_guard", "entitlement")
+        for s in timing.get_samples(rail)
+    )
+
+    assert nested_ms <= tool_ms, "the rails run inside the tool span, not beside it"
 
 
 def test_rail_timer_records_rejected_calls_too():

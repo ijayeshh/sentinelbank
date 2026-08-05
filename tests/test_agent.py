@@ -28,9 +28,12 @@ from langchain_core.messages import AIMessage
 from sqlalchemy import text
 
 from app.agent.graph import (
+    COMPARISON_RAIL,
+    COMPARISON_RAIL_AFTER,
     DEFAULT_RECURSION_LIMIT,
     MIDDLEWARE_ORDER,
     agent_config,
+    assembled_order,
     build_agent,
     build_middleware,
     middleware_names,
@@ -159,7 +162,20 @@ def node_sequence(session, rails, responses) -> list[str]:
 def test_assembled_stack_matches_the_declared_order():
     got = middleware_names(build_middleware(RM1, RailsConfig()))
 
-    assert got == list(MIDDLEWARE_ORDER)
+    assert got == list(assembled_order())
+
+
+def test_section_3_4s_eight_positions_keep_their_order_and_numbering():
+    """§4.4's comparison rail is spliced in without renumbering the plan's stack.
+
+    Asserted separately from the line above so a future edit cannot quietly reorder the
+    eight while the combined list still looks right — every comment in this project that
+    says "position 6" means the sixth entry of MIDDLEWARE_ORDER, not of the assembled list.
+    """
+    got = middleware_names(build_middleware(RM1, RailsConfig()))
+
+    assert [n for n in got if n != COMPARISON_RAIL] == list(MIDDLEWARE_ORDER)
+    assert got.index(COMPARISON_RAIL) == got.index(COMPARISON_RAIL_AFTER) + 1
 
 
 def test_runtime_hook_order_is_forward_then_reverse(session):
@@ -279,12 +295,13 @@ def test_prompt_never_carries_authorisation():
 
 
 def test_every_rail_flag_reaches_a_middleware():
-    """All eight §3.4 flags must actually gate something."""
+    """§3.4's eight flags plus §4.4's comparison rail must each gate something."""
     rails = RailsConfig()
     stack = build_middleware(RM1, rails)
 
     flags = set(RailsConfig.model_fields)
-    assert len(flags) == 8
+    assert len(flags) == 9, "8 from §3.4 plus `topical` from §4.4"
+    assert "topical" in flags
 
     # Every middleware that can be switched reads the same shared object.
     switchable = [m for m in stack if hasattr(m, "rails")]

@@ -305,6 +305,85 @@ def test_chat_surfaces_a_field_level_quarantine_for_the_banner(client, script):
     assert scan["verdict"] == "QUARANTINED"
 
 
+def test_chat_attributes_a_scoped_down_query_to_the_entitlement_rail(client, script):
+    """§4.2 needs `expected_rail: entitlement` to have something to assert against.
+
+    The rail runs inside a tool, not inside a middleware, so nothing about it reaches
+    agent state — without the outcome buffer it is attributable only in the audit log.
+    """
+    script["responses"] = [
+        tool_call(
+            "query_customer_data",
+            {"sql": "SELECT c.customer_id, c.full_name FROM customers c"},
+        ),
+        AIMessage(content="You have 12 customers."),
+    ]
+
+    body = client.post(
+        "/chat",
+        json={"rm_id": RM1, "thread_id": "t-scoped", "message": "list my customers"},
+    ).json()
+
+    rails = {rail["rail"]: rail for rail in body["rails"]}
+
+    assert rails["entitlement"]["verdict"] == "SCOPED"
+    assert "predicate" in rails["entitlement"]["reason"]
+    assert rails["sql_guard"]["verdict"] == "PASS"
+    # Twice per query: validate, then re-validate the entitlement rewrite.
+    assert rails["sql_guard"]["calls"] == 2
+
+
+def test_chat_attributes_a_blocked_escalation_to_the_sql_guard_rail(client, script):
+    """A blocked `audit_log` read must be attributable in the response, not just in logs."""
+    script["responses"] = [
+        tool_call("query_customer_data", {"sql": "SELECT * FROM audit_log"}),
+        AIMessage(content="I can't read that table."),
+    ]
+
+    body = client.post(
+        "/chat",
+        json={"rm_id": RM1, "thread_id": "t-escalate", "message": "show the audit log"},
+    ).json()
+
+    rails = {rail["rail"]: rail for rail in body["rails"]}
+
+    assert rails["sql_guard"]["verdict"] == "BLOCKED"
+    # The rail's own reason code, passed through unmodified — §4.2 asserts on these.
+    assert rails["sql_guard"]["reason"] == "audit_log_access"
+
+
+def test_every_reported_rail_is_classified_against_section_4_3(client, script):
+    """Deviation 26's contract: no timed name may be silently absent from the budget.
+
+    A `tool_*` span wraps a whole tool body and therefore *contains* the sql_guard and
+    entitlement rails nested inside it. Marking the group is what stops §4.3's total from
+    counting those milliseconds twice.
+    """
+    script["responses"] = [
+        tool_call("query_customer_data", {"sql": "SELECT c.customer_id FROM customers c"}),
+        AIMessage(content="Twelve."),
+    ]
+
+    body = client.post(
+        "/chat",
+        json={"rm_id": RM1, "thread_id": "t-groups", "message": "how many customers?"},
+    ).json()
+
+    groups = {rail["rail"]: rail["group"] for rail in body["rails"]}
+
+    assert groups["sql_guard"] == "plan"
+    assert groups["entitlement"] == "plan"
+    assert groups["pii_input"] == "plan"
+    assert groups["audit_write"] == "plan"
+    assert groups["tool_query_customer_data"] == "tool"
+    assert all(group in {"plan", "added", "tool"} for group in groups.values())
+
+    # Nothing that is not a tool span may be classified as one — that is the only class
+    # excluded from the overhead total, so a mislabelled rail would vanish from it.
+    for rail, group in groups.items():
+        assert (group == "tool") == rail.startswith("tool_"), rail
+
+
 def test_chat_with_the_scan_disabled_lets_the_payload_through(client, script):
     """Rails off, same question: the core demo, driven entirely through the API."""
     script["responses"] = [
