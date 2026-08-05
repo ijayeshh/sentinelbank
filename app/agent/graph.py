@@ -78,6 +78,7 @@ from app.rails.hitl import HardBlockMiddleware, build_hitl_middleware, build_wri
 from app.rails.injection import InjectionMiddleware, ToolResultInjectionMiddleware
 from app.rails.pii import PersonPseudonymMiddleware, build_pii_middleware
 from app.rails.spotlight import SpotlightMiddleware
+from app.rails.topics import TopicalMiddleware
 
 # §3.4's stack, as a declared contract rather than a comment. The test asserts the
 # assembled agent matches this, so reordering the code without reordering this constant
@@ -92,6 +93,20 @@ MIDDLEWARE_ORDER: tuple[str, ...] = (
     "SpotlightMiddleware",
     "AuditMiddleware",
 )
+
+# §4.4's topical-restriction rail is NOT one of §3.4's eight positions and is kept out of
+# `MIDDLEWARE_ORDER` on purpose: that constant is the plan's numbered stack, and folding a
+# ninth entry into it would quietly redefine what "position 8" means in every comment and
+# test that refers to it. It is declared separately, with its insertion point named, so
+# the assembled order is still asserted end to end.
+COMPARISON_RAIL = "TopicalMiddleware"
+COMPARISON_RAIL_AFTER = "InjectionMiddleware"
+
+
+def assembled_order() -> tuple[str, ...]:
+    """§3.4's eight with §4.4's comparison rail spliced in at its documented position."""
+    index = MIDDLEWARE_ORDER.index(COMPARISON_RAIL_AFTER) + 1
+    return MIDDLEWARE_ORDER[:index] + (COMPARISON_RAIL,) + MIDDLEWARE_ORDER[index:]
 
 
 # LangGraph counts every middleware hook as its own super-step, and this stack is deep:
@@ -108,7 +123,14 @@ MIDDLEWARE_ORDER: tuple[str, ...] = (
 # 100 allows roughly two tool round-trips, which is what a text-to-SQL answer needs
 # (query, then summarise), while still catching a genuinely looping 3B model rather than
 # letting it spin until the context window fills.
-DEFAULT_RECURSION_LIMIT = 100
+#
+# **Raised from 100 to 120 when §4.4's topical rail was added.** One no-tool turn costs 34
+# super-steps with the ninth middleware in place, and `tests/test_agent.py` requires the
+# limit to be at least 3x that — 102 — so 100 no longer cleared its own safety margin.
+# That margin is not academic: the red-team run recorded two real `GraphRecursionError`
+# responses at the old limit (defect 37), one of them on a *benign* query, and a 500 from
+# an exhausted budget is indistinguishable to the caller from a looping model.
+DEFAULT_RECURSION_LIMIT = 120
 
 
 def agent_config(thread_id: str, recursion_limit: int = DEFAULT_RECURSION_LIMIT) -> dict[str, Any]:
@@ -240,6 +262,11 @@ def build_middleware(
 
     return [
         InjectionMiddleware(rails),  # 1
+        # §4.4's comparison rail. Not one of §3.4's eight positions, and placed directly
+        # after the injection scan on purpose: a prompt that is both an injection and an
+        # advice request should be reported as the injection, which is the more serious
+        # finding and the one the audit log needs to carry.
+        TopicalMiddleware(rails),
         *redactors,  # 2 + 3
         *pseudonym,  # 4
         gate,  # 5

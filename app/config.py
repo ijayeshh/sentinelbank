@@ -38,6 +38,11 @@ class RailsConfig(BaseModel):
     spotlight: bool = True
     # 8. SHA-256 hash-chained audit write.
     audit: bool = True
+    # 9. Topical restriction: no investment, tax or retirement advice (§4.4). Not one of
+    #    §3.4's eight positions — it is the comparison rail, implemented twice, and the
+    #    Colang twin lives in nemo/rails/topics.co. Toggleable like the rest so the demo
+    #    can show the same prompt refused and answered.
+    topical: bool = True
 
     # Mutable at runtime on purpose. The middleware instances baked into the compiled
     # graph hold a reference to *this object* and re-read their flag on every hook, so

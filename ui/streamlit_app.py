@@ -135,7 +135,28 @@ VERDICT_TONE = {
     "BLOCKED": "alert",
     "QUARANTINED": "alert",
     "AWAITING_APPROVAL": "warn",
+    "SCOPED": "ok",
+    "PASS": "ok",
     "RAN": "ok",
+}
+
+# Rails that run inside a tool rather than as §3.4 middleware, so they have no position in
+# the stack above but must still be visible: a blocked `DROP TABLE` or a query rewritten to
+# the RM's own book is the clearest evidence in the whole panel that a rail did something.
+# Rendered under the table rather than as fake ninth and tenth positions.
+TOOL_LAYER_RAILS: tuple[tuple[str, str], ...] = (
+    ("sql_guard", "SQL safety — AST validation, allowlist, LIMIT clamp"),
+    ("entitlement", "Entitlement — rm_id predicate injected into every SELECT"),
+)
+
+# §4.4's comparison rail. Rendered apart from the eight because it is not one of §3.4's
+# positions — it exists to be implemented twice (here and in nemo/rails/topics.co) and
+# compared, not because the plan's stack needed a ninth entry.
+COMPARISON_RAIL: dict[str, Any] = {
+    "flag": "topical",
+    "label": "Topical restriction (§4.4 comparison rail)",
+    "protects": "No investment, tax or retirement advice — an RM copilot is not licensed",
+    "rails": ("topical",),
 }
 
 
@@ -286,7 +307,9 @@ def push_rail(flag: str) -> None:
 
 
 def set_all_rails(value: bool) -> None:
-    ok, result = api_post("/config/rails", {item["flag"]: value for item in RAIL_STACK})
+    flags = {item["flag"]: value for item in RAIL_STACK}
+    flags[COMPARISON_RAIL["flag"]] = value
+    ok, result = api_post("/config/rails", flags)
     if ok:
         for flag, current in result.items():
             st.session_state[f"rail_{flag}"] = current
@@ -366,6 +389,15 @@ def render_sidebar() -> None:
                 args=(item["flag"],),
             )
             st.caption(item["protects"])
+
+        # Rendered after the eight, unnumbered, because it is not a §3.4 position.
+        st.toggle(
+            f"**{COMPARISON_RAIL['label']}**",
+            key=f"rail_{COMPARISON_RAIL['flag']}",
+            on_change=push_rail,
+            args=(COMPARISON_RAIL["flag"],),
+        )
+        st.caption(COMPARISON_RAIL["protects"])
 
         if st.session_state.get("rail_error"):
             st.error(st.session_state.pop("rail_error"))
@@ -548,7 +580,15 @@ def render_rail_panel(payload: dict[str, Any]) -> None:
     active = sum(
         1 for item in RAIL_STACK if st.session_state.get(f"rail_{item['flag']}", True)
     )
-    total_ms = sum(report["latency_ms"] for report in payload.get("rails", []))
+    # Guardrail time only. `group == "tool"` spans wrap a whole tool body — including the
+    # sql_guard and entitlement rails nested inside it and the Postgres round-trip — so
+    # counting them here would report the same milliseconds twice and present database
+    # time as guardrail overhead.
+    total_ms = sum(
+        report["latency_ms"]
+        for report in payload.get("rails", [])
+        if report.get("group") != "tool"
+    )
 
     st.markdown(
         "<div style='display:flex;justify-content:space-between;align-items:baseline;"
@@ -564,9 +604,40 @@ def render_rail_panel(payload: dict[str, Any]) -> None:
         "<th style='text-align:right;padding:0 8px'>SCORE</th>"
         "<th style='text-align:right;padding:0 8px'>LATENCY</th></tr>"
         + "".join(rail_row(item, reports) for item in RAIL_STACK)
+        + rail_row({**COMPARISON_RAIL, "n": "§4.4", "shared": False}, reports)
         + "</table>",
         unsafe_allow_html=True,
     )
+
+    tool_layer = [
+        (label, reports[name]) for name, label in TOOL_LAYER_RAILS if name in reports
+    ]
+    if tool_layer:
+        st.markdown(
+            "<div style='font-size:0.7rem;opacity:0.6;letter-spacing:0.06em;"
+            "margin-top:10px'>INSIDE THE TOOL CALL</div>"
+            "<table style='width:100%;border-collapse:collapse;font-size:0.86rem'>"
+            + "".join(
+                "<tr style='border-top:1px solid rgba(120,113,108,0.22)'>"
+                f"<td style='padding:6px 8px'><b>{esc(label)}</b>"
+                + (
+                    f"<br><span style='font-size:0.76rem;opacity:0.7'>"
+                    f"{esc(str(report['reason']))}</span>"
+                    if report.get("reason")
+                    else ""
+                )
+                + "</td>"
+                f"<td style='padding:6px 8px;text-align:right'>"
+                f"{chip(report['verdict'], VERDICT_TONE.get(report['verdict'], 'ok'))}</td>"
+                f"<td style='padding:6px 8px;text-align:right;"
+                f"font-variant-numeric:tabular-nums;white-space:nowrap'>"
+                f"{report['latency_ms']:,.1f} ms</td></tr>"
+                for label, report in tool_layer
+            )
+            + "</table>",
+            unsafe_allow_html=True,
+        )
+
     st.caption(
         "Positions 2-4 are all PII middleware and share the same three latency counters, "
         "so their figure is the shared total rather than a per-position split. "

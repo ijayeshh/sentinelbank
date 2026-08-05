@@ -51,15 +51,30 @@ something unsafe" (revalidate). The third is a bug in this project, not an attac
 it should be impossible to confuse the two.
 
 --------------------------------------------------------------------------------
-LATENCY
+LATENCY AND ATTRIBUTION
 --------------------------------------------------------------------------------
-§2.5's `@rail_timer` is not implemented yet. When it is, it attaches to the three
-`_stage_*` helpers below, giving the `sql_guard` and `entitlement` rows of the §4.3
-latency budget table without any further change here.
+§2.5's `@rail_timer` attaches to the three `_stage_*` helpers below rather than to
+`validate_sql` and `enforce_entitlement` themselves. That placement is deliberate:
+both of those modules state that they carry no dependency on timing, config or the
+database so they can be unit-tested with no services running, and decorating them in
+place would break that. Wrapping them here keeps the isolation and still fills the
+`sql_guard` and `entitlement` rows of §4.3's latency budget table.
+
+Note that **`sql_guard` is sampled twice per query** — once for step 1 and once for
+step 3 — because the rail genuinely runs twice. Summing its samples per request is
+therefore the honest per-request cost, not a double count.
+
+The outcome ring buffer below exists for the same reason `injection.py` keeps its
+incidents on the middleware instance: §3.6's `/chat` has to report which rails fired,
+and these two run inside a tool rather than inside a middleware, so nothing about them
+reaches agent state. Without the buffer, a blocked `DROP TABLE` or a scoped-down
+portfolio query is attributable only in the audit log — which is exactly the thing
+§4.2's `expected_rail` assertion cannot read.
 """
 
 from __future__ import annotations
 
+from collections import deque
 from typing import Any
 
 import sqlglot
@@ -67,8 +82,14 @@ from sqlalchemy import text
 from sqlglot.errors import SqlglotError
 
 from app.db import get_session
-from app.rails.entitlement import ENTITLEMENT_PARAM, enforce_entitlement
-from app.rails.sql_guard import DIALECT, validate_sql
+from app.rails.entitlement import ENTITLEMENT_PARAM, EntitlementVerdict, enforce_entitlement
+from app.rails.sql_guard import DIALECT, SqlVerdict, validate_sql
+from app.rails.timing import rail_timer
+
+# §4.3's table names for these two rails. Stable strings: the latency report groups on
+# them and the red-team harness asserts `expected_rail` against them.
+RAIL_SQL_GUARD = "sql_guard"
+RAIL_ENTITLEMENT = "entitlement"
 
 # The stage names that appear in the returned dict, and in the audit log after it.
 # Stable strings — the Phase 4 harness asserts on them (§4.2).
@@ -78,13 +99,81 @@ STAGE_REVALIDATE = "revalidate"  # step 3: sql_guard on the rewritten SQL
 STAGE_EXECUTE = "execute"  # step 4: the database
 
 
+# ================================================================================
+# Timed stages (§2.5, §4.3)
+# ================================================================================
+
+
+@rail_timer(RAIL_SQL_GUARD)
+def _stage_validate(sql: str) -> SqlVerdict:
+    """Step 1: sql_guard on the model's raw SQL."""
+    return validate_sql(sql)
+
+
+@rail_timer(RAIL_ENTITLEMENT)
+def _stage_entitlement(tree: Any, rm_id: str) -> EntitlementVerdict:
+    """Step 2: rm_id predicate injection."""
+    return enforce_entitlement(tree, rm_id)
+
+
+@rail_timer(RAIL_SQL_GUARD)
+def _stage_revalidate(sql: str) -> SqlVerdict:
+    """Step 3: sql_guard again, on what the rewrite produced.
+
+    Timed under the same name as step 1 on purpose. It is the same rail doing the same
+    work; splitting it into `sql_guard_revalidate` would let a reader of §4.3's table
+    conclude the rail costs half what it does.
+    """
+    return validate_sql(sql)
+
+
+# ================================================================================
+# Outcome buffer — so `/chat` can attribute these two rails (§3.6)
+# ================================================================================
+
+# Bounded for the same reason `timing.py`'s sample buffer is: a long-running demo must
+# not grow the process without limit on an 8 GB machine. One entry per `safe_execute`,
+# and a single turn makes at most a handful of tool calls.
+_OUTCOME_BUFFER_SIZE = 256
+
+_OUTCOMES: deque[dict[str, Any]] = deque(maxlen=_OUTCOME_BUFFER_SIZE)
+
+
+def _record_outcome(
+    allowed: bool, stage: str, reason: str, predicates: int = 0
+) -> None:
+    """Note what the pipeline decided, for the response assembler to read.
+
+    `predicates` is how many entitlement predicates the rewrite injected — one per
+    scoped SELECT. Zero is not a failure: a pure `policy_chunks` RAG query has nothing
+    customer-owned in it and is correctly left alone. It is recorded so `/chat` can tell
+    "the rail ran and had nothing to scope" from "the rail rewrote this query", which is
+    the difference between a rail that is working and a rail that is a no-op.
+    """
+    _OUTCOMES.append(
+        {"allowed": allowed, "stage": stage, "reason": reason, "predicates": predicates}
+    )
+
+
+def get_sql_outcomes() -> list[dict[str, Any]]:
+    """Pipeline outcomes recorded so far, oldest first."""
+    return list(_OUTCOMES)
+
+
+def clear_sql_outcomes() -> None:
+    """Empty the buffer. For tests, and for a clean red-team run."""
+    _OUTCOMES.clear()
+
+
 def _rejected(stage: str, reason: str) -> dict[str, Any]:
     """Build a rejection.
 
     Every rejection funnels through here so that no partial result — no SQL string, no
     bind parameters, no half-filled row list — can escape alongside `allowed: False`.
-    A caller that ignores the flag still gets nothing usable.
+    A caller that ignores the flag still gets nothing usable. It is also the one place a
+    rejection is recorded, so no future early-return can forget to report itself.
     """
+    _record_outcome(False, stage, reason)
     return {
         "allowed": False,
         "stage": stage,
@@ -141,7 +230,7 @@ def safe_execute(
     # --- Step 1: validate the model's raw SQL -----------------------------------
     # Nothing about the input is trusted yet, including that it is a SELECT, that it is
     # one statement, or that it is SQL at all.
-    guard = validate_sql(sql)
+    guard = _stage_validate(sql)
     if not guard.allowed:
         return _rejected(STAGE_VALIDATE, guard.reason)
 
@@ -159,15 +248,20 @@ def safe_execute(
     if tree is None:
         return _rejected(STAGE_ENTITLEMENT, "unparseable_validated_sql")
 
-    entitlement = enforce_entitlement(tree, rm_id)
+    entitlement = _stage_entitlement(tree, rm_id)
     if not entitlement.allowed:
         return _rejected(STAGE_ENTITLEMENT, entitlement.reason)
+
+    # One `:current_rm` placeholder per scoped SELECT. Counted off the rewritten SQL
+    # rather than tracked through the rail, so it measures what will actually be
+    # executed rather than what the rewrite believes it did.
+    predicates = entitlement.sql.count(f":{ENTITLEMENT_PARAM}")
 
     # --- Step 3: re-validate what the rewrite produced --------------------------
     # See the module docstring. Step 2 mutated the tree and regenerated the text; this
     # is the check that the result is still a single read-only SELECT over allowlisted
     # tables with a bounded LIMIT. It runs on `entitlement.sql`, never on `guard.safe_sql`.
-    revalidated = validate_sql(entitlement.sql)
+    revalidated = _stage_revalidate(entitlement.sql)
     if not revalidated.allowed:
         # Reaching here means the entitlement rail emitted something sql_guard refuses
         # — a defect in this project rather than an attack. It is still handled the
@@ -211,6 +305,7 @@ def safe_execute(
         # caller gets the fact of the failure; the values stay in the database.
         return _rejected(STAGE_EXECUTE, "execution_error")
 
+    _record_outcome(True, STAGE_EXECUTE, "ok", predicates)
     return {
         "allowed": True,
         "stage": STAGE_EXECUTE,

@@ -92,6 +92,16 @@ logger = logging.getLogger(__name__)
 
 RAIL_HITL = "hitl_interrupt"
 
+# The sanctions screen is a separate rail from the approval gate, and §3.8 turns on the
+# distinction: `hitl_interrupt` asks a human, `hitl_hard_block` refuses whatever the human
+# said. It was previously reported in `/chat`'s `warnings[].rail` but never timed, which
+# made it the one rail a reviewer could see fire and could not see cost. It is timed on
+# `_ofac_flagged` — the database lookup — rather than on the whole `wrap_tool_call`,
+# because that wrapper's span includes `handler(request)`, i.e. the entire tool execution.
+# A rail whose "latency" is really the tool's latency would inflate §4.3's budget table
+# with work the rail did not do.
+RAIL_HARD_BLOCK = "hitl_hard_block"
+
 # §3.3: file-backed so state survives the pause. A pause here is not milliseconds — it is
 # however long an RM takes to read a diff and decide, across which the process may restart.
 DEFAULT_CHECKPOINT_PATH = "./checkpoints.db"
@@ -418,6 +428,7 @@ class HardBlockMiddleware(AgentMiddleware):
         """
         return True
 
+    @rail_timer(RAIL_HARD_BLOCK)
     def _ofac_flagged(self, args: dict[str, Any]) -> bool:
         """Whether the account or customer named in `args` carries a sanctions flag.
 

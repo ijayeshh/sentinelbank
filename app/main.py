@@ -71,9 +71,21 @@ from app.audit.chain import count_entries, read_entries, verify_chain_detailed
 from app.config import RailsConfig, settings
 from app.db import get_session
 from app.llm import LLMError, llm
-from app.rails.hitl import DEFAULT_CHECKPOINT_PATH, HardBlockMiddleware, build_checkpointer
+from app.rails.hitl import (
+    DEFAULT_CHECKPOINT_PATH,
+    RAIL_HARD_BLOCK,
+    HardBlockMiddleware,
+    build_checkpointer,
+)
 from app.rails.injection import ToolResultInjectionMiddleware, get_classifier_info
 from app.rails.pii import pii_request
+from app.rails.sql_pipeline import (
+    RAIL_ENTITLEMENT,
+    RAIL_SQL_GUARD,
+    STAGE_ENTITLEMENT,
+    STAGE_EXECUTE,
+    get_sql_outcomes,
+)
 from app.rails.timing import get_samples
 
 logger = logging.getLogger(__name__)
@@ -288,13 +300,23 @@ class ChatRequest(BaseModel):
 
 
 class RailReport(BaseModel):
-    """One rail's contribution to this request (§3.7's rail status panel)."""
+    """One rail's contribution to this request (§3.7's rail status panel).
+
+    `reason` carries the rejecting rail's own code — `audit_log_access`,
+    `unlinked_scoped_table:a` — unmodified. Those codes are a contract with §4.2's
+    harness, which asserts on *which* rail fired and *why*, and rewording them here
+    would break the tests that prove it.
+
+    `group` is what keeps §4.3's latency budget honest. See `RAIL_GROUPS`.
+    """
 
     rail: str
     verdict: str
     score: float | None = None
+    reason: str | None = None
     latency_ms: float
     calls: int
+    group: Literal["plan", "added", "tool"] = "added"
 
 
 class SecurityWarning(BaseModel):
@@ -389,6 +411,7 @@ class RailsUpdate(BaseModel):
     injection_tool_result: bool | None = None
     spotlight: bool | None = None
     audit: bool | None = None
+    topical: bool | None = None
 
 
 # ================================================================================
@@ -399,34 +422,141 @@ class RailsUpdate(BaseModel):
 # merely scanned. Everything else reports RAN — the rail did its work and found nothing.
 _FLAGGING_RAILS = {"injection_input", "injection_tool_result", "hitl_interrupt"}
 
+# --------------------------------------------------------------------------------
+# The rail set, reconciled against §4.3
+# --------------------------------------------------------------------------------
+# §4.3's latency table names eight rows. The running system emits more names than that,
+# and lumping them together makes the table's "total rail overhead" figure wrong in a way
+# nobody would notice — so every timed name is classified here, once:
+#
+#   "plan"  — one of §4.3's eight rows, reported under the plan's own name.
+#   "added" — a real guardrail the plan's table did not anticipate. `spotlight` (§3.4
+#             position 7, deviation 23), `hitl_interrupt` (§3.3's approval gate) and
+#             `hitl_hard_block` (§3.3's sanctions screen) all do guardrail work and all
+#             belong in the overhead total; they were simply missing from the table.
+#   "tool"  — NOT a guardrail. A `tool_*` span wraps an entire tool body, which *contains*
+#             `sql_guard`, `entitlement` and the database round-trip. Its time overlaps
+#             the rails nested inside it, so adding it to a rail total counts the same
+#             milliseconds twice and buries Postgres inside the guardrail budget.
+#
+# Anything unrecognised falls to "added" rather than "tool": a new rail nobody classified
+# should show up in the overhead figure, not silently vanish from it.
+SECTION_4_3_RAILS: frozenset[str] = frozenset(
+    {
+        "pii_input",
+        "injection_input",
+        "injection_tool_result",
+        RAIL_SQL_GUARD,
+        RAIL_ENTITLEMENT,
+        "pii_tool_result",
+        "pii_output",
+        "audit_write",
+    }
+)
+
+_TOOL_SPAN_PREFIX = "tool_"
+
+
+def _rail_group(rail: str) -> Literal["plan", "added", "tool"]:
+    """Which of the three classes above `rail` belongs to."""
+    if rail in SECTION_4_3_RAILS:
+        return "plan"
+    if rail.startswith(_TOOL_SPAN_PREFIX):
+        return "tool"
+    return "added"
+
+
+def _sql_verdicts(
+    outcomes: list[dict[str, Any]],
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Verdicts and reason codes for `sql_guard` and `entitlement` (§3.6).
+
+    These two rails run inside a tool rather than inside a middleware, so unlike the
+    injection rails nothing about them reaches agent state. `sql_pipeline` records each
+    outcome instead, and this turns that record into something the UI can render and
+    §4.2's harness can assert on.
+
+    Attribution follows the pipeline's own `stage`, which is what that field is for:
+    `validate` and `revalidate` are sql_guard rejecting, `entitlement` is the scoping
+    rail rejecting. The first rejection of each kind wins, because it is the one that
+    stopped the query — a later tool call succeeding does not un-block it.
+    """
+    verdicts: dict[str, str] = {}
+    reasons: dict[str, str] = {}
+
+    for outcome in outcomes:
+        stage, reason = outcome["stage"], outcome["reason"]
+
+        if not outcome["allowed"]:
+            # STAGE_EXECUTE means both rails passed and Postgres failed. Blaming a rail
+            # for a driver error would be a false positive in the one table that exists
+            # to measure false positives.
+            if stage == STAGE_EXECUTE:
+                continue
+            rail = RAIL_ENTITLEMENT if stage == STAGE_ENTITLEMENT else RAIL_SQL_GUARD
+            if rail not in verdicts:
+                verdicts[rail], reasons[rail] = "BLOCKED", reason
+            continue
+
+        # Allowed. sql_guard passed it twice; say so rather than leaving the row blank.
+        verdicts.setdefault(RAIL_SQL_GUARD, "PASS")
+        # SCOPED is the interesting verdict, and the one §3.8's entitlement criterion
+        # turns on: the query that reached the database is not the query the model wrote.
+        # A zero-predicate pass is a policy_chunks query with nothing to scope.
+        if outcome["predicates"] and verdicts.get(RAIL_ENTITLEMENT) != "BLOCKED":
+            verdicts[RAIL_ENTITLEMENT] = "SCOPED"
+            reasons[RAIL_ENTITLEMENT] = f"{outcome['predicates']} predicate(s) injected"
+        else:
+            verdicts.setdefault(RAIL_ENTITLEMENT, "PASS")
+
+    return verdicts, reasons
+
 
 def _rail_reports(
     samples: list[dict[str, Any]],
     flags: list[dict[str, Any]],
     incidents: list[Any],
     interrupted: bool,
+    sql_outcomes: list[dict[str, Any]] | None = None,
+    blocked: list[dict[str, Any]] | None = None,
 ) -> list[RailReport]:
     """Aggregate this request's rails into §3.7's status panel rows.
 
     Latency is summed per rail rather than averaged: an RM asking "what did the rails
     cost me" wants the total added to their request, and the PII rail is invoked twelve
     times per turn precisely so §4.3 can attribute each application point separately.
+    `sql_guard` is summed for the same reason — it genuinely runs twice per query, once
+    before the entitlement rewrite and once after it.
     """
     scores: dict[str, float] = {}
     verdicts: dict[str, str] = {}
+    reasons: dict[str, str] = {}
 
     for flag in flags:
         rail = str(flag.get("rail") or "injection_input")
         verdicts[rail] = "BLOCKED"
+        if flag.get("reason"):
+            reasons[rail] = str(flag["reason"])
         if flag.get("score") is not None:
             scores[rail] = max(scores.get(rail, 0.0), float(flag["score"]))
 
     if incidents:
         verdicts["injection_tool_result"] = "QUARANTINED"
         scores["injection_tool_result"] = max(float(i.score) for i in incidents)
+        reasons["injection_tool_result"] = f"{len(incidents)} field(s) quarantined"
 
     if interrupted:
         verdicts["hitl_interrupt"] = "AWAITING_APPROVAL"
+
+    # The sanctions screen. It has always been reported in `warnings[]`; this is what puts
+    # it in the rail table too, beside the approval gate it is deliberately separate from.
+    if blocked:
+        verdicts[RAIL_HARD_BLOCK] = "BLOCKED"
+        reasons[RAIL_HARD_BLOCK] = str(blocked[0].get("reason") or "ofac_hard_block")
+
+    sql_verdicts, sql_reasons = _sql_verdicts(sql_outcomes or [])
+    verdicts.update(sql_verdicts)
+    reasons.update(sql_reasons)
 
     aggregated: dict[str, RailReport] = {}
     for sample in samples:
@@ -437,8 +567,10 @@ def _rail_reports(
                 rail=rail,
                 verdict=verdicts.get(rail, "RAN"),
                 score=scores.get(rail),
+                reason=reasons.get(rail),
                 latency_ms=0.0,
                 calls=0,
+                group=_rail_group(rail),
             )
             aggregated[rail] = report
         report.latency_ms = round(report.latency_ms + sample["duration_ms"], 3)
@@ -449,7 +581,13 @@ def _rail_reports(
     for rail, verdict in verdicts.items():
         if rail not in aggregated:
             aggregated[rail] = RailReport(
-                rail=rail, verdict=verdict, score=scores.get(rail), latency_ms=0.0, calls=0
+                rail=rail,
+                verdict=verdict,
+                score=scores.get(rail),
+                reason=reasons.get(rail),
+                latency_ms=0.0,
+                calls=0,
+                group=_rail_group(rail),
             )
 
     return sorted(aggregated.values(), key=lambda r: r.rail)
@@ -499,7 +637,7 @@ def _warnings(flags: list[dict[str, Any]], incidents: list[Any], blocked: list[d
         warnings.append(
             SecurityWarning(
                 kind="hard_block",
-                rail="hitl_hard_block",
+                rail=RAIL_HARD_BLOCK,
                 message=(
                     f"{block['tool']} was refused: the customer carries a sanctions flag. "
                     "This cannot be approved and has been escalated to compliance."
@@ -552,7 +690,7 @@ def _pending_actions(result: dict[str, Any]) -> list[PendingAction]:
 
 def _decision(result: dict[str, Any], interrupted: bool) -> str:
     """The §1.5 decision value for this turn, matching what the audit rail recorded."""
-    if result.get("injection_flags"):
+    if result.get("injection_flags") or result.get("topic_flags"):
         return "BLOCKED"
     if interrupted:
         return "PENDING_APPROVAL"
@@ -567,6 +705,7 @@ class _Run:
     samples: list[dict[str, Any]]
     incidents: list[Any]
     blocked: list[dict[str, Any]]
+    sql_outcomes: list[dict[str, Any]]
     elapsed_ms: float
 
 
@@ -589,6 +728,7 @@ def _invoke(bundle: AgentBundle, payload: Any, thread_id: str) -> _Run:
         first_sample = len(get_samples())
         first_incident = len(scan.incidents) if scan else 0
         first_block = len(hard_block.blocked) if hard_block else 0
+        first_outcome = len(get_sql_outcomes())
 
         started = time.perf_counter()
         with pii_request(thread_id):
@@ -600,6 +740,7 @@ def _invoke(bundle: AgentBundle, payload: Any, thread_id: str) -> _Run:
             samples=get_samples()[first_sample:],
             incidents=list(scan.incidents[first_incident:]) if scan else [],
             blocked=list(hard_block.blocked[first_block:]) if hard_block else [],
+            sql_outcomes=get_sql_outcomes()[first_outcome:],
             elapsed_ms=elapsed_ms,
         )
 
@@ -616,6 +757,10 @@ def _respond(rm_id: str, thread_id: str, run: _Run) -> ChatResponse:
         state.pending.pop(thread_id, None)
 
     flags = list(run.result.get("injection_flags") or [])
+    # §4.4's topical rail reports through the same `rails[]` mechanism — its flag dicts
+    # already carry `rail` and `reason` — but NOT through `_warnings`, which would label
+    # a refusal to give tax advice as a prompt-injection attempt in the red banner.
+    rail_flags = flags + list(run.result.get("topic_flags") or [])
 
     return ChatResponse(
         thread_id=thread_id,
@@ -624,7 +769,14 @@ def _respond(rm_id: str, thread_id: str, run: _Run) -> ChatResponse:
         decision=_decision(run.result, interrupted),
         interrupted=interrupted,
         pending=pending,
-        rails=_rail_reports(run.samples, flags, run.incidents, interrupted),
+        rails=_rail_reports(
+            run.samples,
+            rail_flags,
+            run.incidents,
+            interrupted,
+            run.sql_outcomes,
+            run.blocked,
+        ),
         warnings=_warnings(flags, run.incidents, run.blocked),
         audit_event_id=run.result.get("audit_event_id"),
         elapsed_ms=run.elapsed_ms,

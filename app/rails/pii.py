@@ -344,12 +344,46 @@ def _strip_possessive(text: str, start: int, end: int) -> int:
     return end
 
 
+# Characters that never appear inside a US retail-bank customer name, and that mark a
+# PERSON candidate as a fragment of Python's `repr` rather than a person. See
+# `_is_schema_artifact` for the measurements.
+_NON_NAME_CHARS = frozenset("0123456789()[]{}=<>|@#$%^&*+")
+
+
 def _is_schema_artifact(value: str) -> bool:
-    """Whether a PERSON candidate is really a column name or serialization noise.
+    """Whether a PERSON candidate is really a column name, an enum, or repr noise.
 
     spaCy is doing its job — `date_of_birth` genuinely looks like a proper noun out of
     context — but a column name is not a customer, and replacing one with a pseudonym
     token damages the data structure the model reads.
+
+    ----------------------------------------------------------------------------
+    THE TWO SHAPE RULES, AND THE MEASUREMENTS BEHIND THEM (README defect 26)
+    ----------------------------------------------------------------------------
+    The rail scans the flat `str()` rendering of a tool envelope, so spaCy sees Python
+    repr fragments and SQL enum values as if they were prose. Both were observed
+    destroying real data in the rails-ON demo:
+
+        'amount':  {'value': Decimal('-2004.42')}  -> <PERSON_c087>
+        'channel': {'value': 'ZELLE'}              -> <PERSON_572d>
+
+    Rule A — **a name contains no digits and no bracket punctuation.** Catches
+    `Decimal('-2004.42` and `8)` (a tail of `datetime.datetime(2025, 6, 3, 22, 28)`).
+
+    Rule B — **a single all-caps token is an enum, not a name.** Measured over every one
+    of the 625 free-text fields in the seeded database plus the rendered envelopes of
+    four accounts: the *only* single-token all-caps value spaCy ever calls a PERSON is
+    `ZELLE`, 65 occurrences, and it is `transactions.channel`. Multi-word all-caps spans
+    are left alone because they are usually genuine — `MAUREEN W`, `STACEY H`, the Zelle
+    counterparties inside a memo — which is why the rule tests for a single token rather
+    than for capitalisation alone.
+
+    Cost of rule B, measured rather than assumed: **7 single-token counterparty first
+    names** across the 625 fields (`BRETT`, `STACEY`, `KELLY`, `TINA`, `KATHRYN`, and two
+    more) stop being pseudonymized and reach the model in the clear. They are third
+    parties named in an untrusted memo, not customers in the RM's book. **Zero of the 40
+    seeded customer names are affected by either rule** — every one is Title Case, and
+    all 40 are still detected as PERSON inside a serialized row.
     """
     normalized = value.strip().lower()
     if not normalized:
@@ -357,7 +391,17 @@ def _is_schema_artifact(value: str) -> bool:
     if normalized in _SCHEMA_COLUMNS:
         return True
     # Serialized identifiers, never human names as they appear in this schema.
-    return "_" in normalized
+    if "_" in normalized:
+        return True
+
+    # Rule A.
+    if any(character in _NON_NAME_CHARS for character in value):
+        return True
+
+    # Rule B. `split()` rather than `" " in value` so that a span whose whitespace is a
+    # tab or a newline is still counted as one token.
+    stripped = value.strip()
+    return len(stripped.split()) == 1 and not any(c.islower() for c in stripped)
 
 
 def resolve_entities(text: str) -> list[ResolvedMatch]:
