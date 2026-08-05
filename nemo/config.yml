@@ -1,4 +1,99 @@
-# NeMo Guardrails config for the comparison branch (PROJECT_PLAN.md §4.4).
-# Points at the same Ollama endpoint as the main stack. Runs ONLY under its own
-# compose profile — NeMo loads its own embedding model and vector index, which the
-# 8 GB RAM budget cannot absorb alongside the main stack. Not implemented until Phase 4.
+# NeMo Guardrails config — Implementation B of the §4.4 comparison rail.
+#
+# Points at the SAME Ollama endpoint the main stack uses, so the comparison isolates the
+# guardrail framework rather than accidentally comparing two different models.
+# `host.docker.internal` resolves to the Windows host from inside the container, where
+# Ollama runs natively — it is not containerised, because it needs the GPU.
+#
+# ============================================================================
+# RUNS ONLY UNDER ITS OWN COMPOSE PROFILE (§1.1 rule 7)
+# ============================================================================
+# The `embeddings` model below is the whole reason for the isolation rule. NeMo embeds
+# every canonical form in rails/topics.co at startup and builds an in-memory vector index
+# to match incoming messages against — roughly 90 MB of MiniLM weights plus the index and
+# the sentence-transformers/torch runtime around it. The main stack is already holding
+# Presidio + spaCy (~560 MB), Prompt-Guard-86M, its own MiniLM, and a 2 GB model in VRAM.
+# Running both is how this machine ends up in the swap file.
+#
+# `docker compose -f docker-compose.nemo.yml up` refuses to start if the main stack is
+# up; the guard is in that file.
+
+models:
+  - type: main
+    engine: ollama
+    model: sentinelbank-llm
+    parameters:
+      base_url: http://host.docker.internal:11434
+      # Matches app/config.py. §1.1 rule 2 caps context at 4096 on a 4 GB card, and a
+      # comparison run at a different context length is not a comparison.
+      num_ctx: 4096
+      # §6 rule 3: determinism is a hard requirement, and the same value the main stack
+      # uses. A comparison run at a different temperature measures the sampler.
+      temperature: 0.1
+
+  # The canonical-form matcher. This is the cost the LangChain implementation does not
+  # pay: a second embedding model, loaded and indexed at startup, purely so that
+  # `define user ask tax advice` can be matched semantically instead of literally.
+  - type: embeddings
+    engine: SentenceTransformers
+    model: all-MiniLM-L6-v2
+
+# There is deliberately NO `rails:` section.
+#
+# The first version of this file listed the four refusal flows under `rails.input.flows`
+# and the multi-turn flow under `rails.dialog.flows`, and it scored 0/8 — every prompt
+# came back `no_flow_matched` in about 10 ms, far too fast to have embedded anything. Two
+# mistakes, both worth recording because they are the kind of thing the Colang learning
+# curve is made of:
+#
+#   * `rails.input.flows` is for INPUT rails — flows that run an action over the incoming
+#     message, like NeMo's own `self check input`. The blocks in rails/topics.co are
+#     dialog flows (`user ...` / `bot ...`), and naming them there does not register them.
+#   * `rails.dialog.flows`, once present, acts as an ALLOWLIST. Listing only the multi-turn
+#     flow silently disabled the four that do the actual refusing.
+#
+# Omitting `flows` entirely activates every `define flow` in rails/, which is the Colang
+# 1.0 default and what this rail wants. Nothing there was a NeMo limitation — it was a
+# misreading of the configuration surface, and it failed *silently*, which is the part
+# worth remembering. NeMo's own jailbreak and self-check rails stay off regardless: §4.4
+# scopes this to exactly one rail implemented twice, and enabling a second would make the
+# accuracy and latency numbers incomparable to the LangChain side.
+
+rails:
+  dialog:
+    user_messages:
+      # ======================================================================
+      # THE SINGLE MOST IMPORTANT LINE IN THIS FILE
+      # ======================================================================
+      # By default, Colang 1.0 maps an utterance to a canonical form by asking the LLM:
+      # it retrieves the nearest examples, builds a few-shot prompt, and has the model
+      # complete `User intent: `. On llama3.2:3b that does not work. Measured, from the
+      # container log on the first attempt:
+      #
+      #   User message: "Which stocks should I recommend to this customer?"
+      #   User intent: """                 <- the model emitted a quote, not an intent
+      #   Bot intent: general response
+      #   ...
+      #   Total processing took 27.23 seconds. LLM Stats: 3 total calls
+      #
+      # Three LLM calls, 27 seconds, no flow matched, no refusal. The 3B model is not
+      # capable of the intent-classification step NeMo's dialog rails are built around.
+      #
+      # `embeddings_only` removes the LLM from that step entirely and matches the incoming
+      # message against the canonical forms in rails/topics.co by vector similarity alone
+      # — which is what §4.4's comparison table means by "canonical forms matched via
+      # vector search", and the mode this comparison should actually be measuring.
+      embeddings_only: True
+      # Cosine similarity a message must reach before a canonical form is considered
+      # matched. NeMo's own default for this mode. Deliberately NOT tuned against the
+      # eight comparison prompts — see the note at the bottom of this file.
+      embeddings_only_similarity_threshold: 0.75
+
+# Left at NeMo's default similarity threshold rather than tuned. Tuning it against the
+# eight comparison prompts would make Implementation B's numbers authored-against, which
+# is the exact methodological problem docs/LIMITATIONS.md §1 exists to avoid on the
+# injection rail. The comparison is only meaningful if neither side was fitted to the
+# test set — and the LangChain side was not.
+core:
+  embedding_search_provider:
+    name: default
